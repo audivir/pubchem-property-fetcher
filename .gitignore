@@ -1,0 +1,10 @@
+__pycache__/
+.benchmarks/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.pdm-build/
+
+.coverage
+.pdm-python
+*.pyc
