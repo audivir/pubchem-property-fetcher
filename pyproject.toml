@@ -29,8 +29,13 @@ dependencies = [
     "yaspin"
 ]
 
+[project.urls]
+Homepage = "https://github.com/audivir/pubchem-property-fetcher"
+Repository = "https://github.com/audivir/pubchem-property-fetcher"
+Issues = "https://github.com/audivir/pubchem-property-fetcher/issues"
+
 [dependency-groups]
-dev = ["mypy", "pytest", "pytest-mypy-testing", "coverage", "prek", "ruff==0.16.4"]
+dev = ["mypy", "pytest", "coverage", "prek", "ruff==0.16.4"]
 
 [tool.pdm.version]
 source = "file"
