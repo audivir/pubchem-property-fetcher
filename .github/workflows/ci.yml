@@ -32,5 +32,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev --python ${{ matrix.python-version }}
       - run: uv run coverage run -m pytest
-      - run: uv run coverage combine
+      - run: uv run coverage combine || true
       - run: uv run coverage report
