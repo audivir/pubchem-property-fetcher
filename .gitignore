@@ -1,12 +1,29 @@
+# python-generated files
 __pycache__/
-.benchmarks/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-.pdm-build/
+*.py[oc]
 build/
 dist/
+wheels/
+*.egg-info
 
-.coverage
+# build artifacts
+.pdm-build
 .pdm-python
-*.pyc
+
+# environment variables
+.env
+
+# virtual environments
+.venv
+
+# test artifacts
+.coverage
+.pytest_cache/
+.mypy_cache/
+
+# lint artifacts
+.ruff_cache
+
+# uv
+uv.lock
+.python-version

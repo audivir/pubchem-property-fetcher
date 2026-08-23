@@ -1,8 +1,8 @@
 # pubchem-property-fetcher
 
-A CLI tool and Python API to resolve chemical SMILES strings and batch-fetch properties using the PubChem PUG REST API. 
+A CLI tool and Python API to resolve chemical SMILES strings and batch-fetch properties using the PubChem PUG REST API.
 
-It handles SMILES canonicalization via RDKit, groups properties to minimize API calls, respects PubChem's rate limits, 
+It handles SMILES canonicalization via RDKit, groups properties to minimize API calls, respects PubChem's rate limits,
 and uses exponential backoff to handle server-side throttling (`429`, `503`). Results are exported as CSV using Polars.
 
 ## Installation
@@ -36,21 +36,29 @@ python -m pubchem_property_fetcher "OCC.CC" "CCO" "CCC" \
 ### Python API
 
 ```python
-import requests
-from pubchem_property_fetcher import clean_smiles, fetch_cid_bulk, fetch_properties_bulk
+import asyncio
+from typing import Any
 
-session = requests.Session()
+from pubchem_property_fetcher import (
+    PubChemClient,
+    clean_smiles,
+    fetch_cid_bulk,
+    fetch_properties_bulk,
+)
 
-# standardize SMILES
-smiles = clean_smiles(["CCO", "CCC"])
-
-# get PubChem Compound IDs (CIDs)
-cids_map = fetch_cid_bulk(smiles, session)
-cids = list(cids_map.values())
 
 # fetch properties
-properties = fetch_properties_bulk(cids, ["IUPACName", "MolecularWeight"], session)
+async def main() -> dict[int, dict[str, Any]]:
+    # standardize SMILES
+    smiles = clean_smiles(["CCO", "CCC"])
 
-print(properties)
+    async with PubChemClient() as client:
+        # get PubChem Compound IDs (CIDs)
+        cids_map = await fetch_cid_bulk(smiles, client)
+        cids = list(cids_map.values())
+        return await fetch_properties_bulk(cids, ["IUPACName", "MolecularWeight"], client)
+
+
+print(asyncio.run(main()))
 # {702: {'IUPACName': 'ethanol', 'MolecularWeight': 46.07}, ...}
 ```

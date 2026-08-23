@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import gzip
 import http
 import logging
@@ -12,25 +14,24 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypeVar
 
 import doctyper
+import httpx
 import yaspin
+from mxhttp import AsyncConsumer, Part, PartValue, get, post
 from tqdm import tqdm
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Callable, Coroutine, Generator, Sequence
 
-    import requests
-
+__version__ = "0.1.2"
 
 logger = logging.getLogger(__name__)
 
-PUBCHEM_ID_EXCHANGE = "https://pubchem.ncbi.nlm.nih.gov/idexchange/idexchange.cgi"
-PUBCHEM_PROPERTIES = (
-    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cids}/property/{props}/JSON"
-)
-PUBCHEM_SYNONYMS = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cids}/synonyms/JSON"
+T = TypeVar("T")
+
+PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov"
 RATE_LIMIT = 5.0  # requests per second
 BACKOFF_DELAY = 1.0  # seconds
 BACKOFF_EXPONENT = 1.5
@@ -50,19 +51,48 @@ class SpinnerDummy:
     text: str = ""
 
 
-def _fetch_with_backoff(
-    url: str, session: requests.Session | None = None, max_retries: int = 5
-) -> requests.Response | None:
-    """Fetch a URL using exponential backoff for rate limits and server errors."""
-    import requests
+class PubChemClient(AsyncConsumer):
+    """Declarative async client for PubChem's ID Exchange and PUG REST endpoints."""
 
-    if not session:
-        session = requests.Session()
+    def __init__(self) -> None:
+        """Binds the client to PubChem's base URL."""
+        super().__init__(PUBCHEM_BASE_URL)
 
+    @post("/idexchange/idexchange.cgi")
+    async def submit_batch(  # type: ignore[empty-body] # noqa: PLR0913,PLR0917
+        self,
+        idstr: Annotated[PartValue, Part],
+        inputtype: Annotated[PartValue, Part] = (None, "smiles"),
+        inputdsn: Annotated[PartValue, Part] = (None, ""),
+        idinput: Annotated[PartValue, Part] = (None, "str"),
+        idfile: Annotated[PartValue, Part] = ("", "", "application/octet-stream"),
+        operatortype: Annotated[PartValue, Part] = (None, "samecid"),
+        outputtype: Annotated[PartValue, Part] = (None, "cid"),
+        outputdsn: Annotated[PartValue, Part] = (None, ""),
+        method: Annotated[PartValue, Part] = (None, "file-pair"),
+        compression: Annotated[PartValue, Part] = (None, "gzip"),
+        submitjob: Annotated[PartValue, Part] = (None, "Submit Job"),
+        xmlfile: Annotated[PartValue, Part] = ("", "", "application/octet-stream"),
+    ) -> str:
+        """Submits a SMILES batch to PubChem's ID Exchange, returning the response HTML."""
+
+    @get("/rest/pug/compound/cid/{cids}/property/{props}/JSON")
+    async def get_properties(self, cids: str, props: str) -> dict[str, Any]:  # type: ignore[empty-body]
+        """Fetches the JSON property table for the given comma-separated CIDs."""
+
+    @get("/rest/pug/compound/cid/{cids}/synonyms/JSON")
+    async def get_synonyms(self, cids: str) -> dict[str, Any]:  # type: ignore[empty-body]
+        """Fetches the JSON synonym list for the given comma-separated CIDs."""
+
+
+async def fetch_with_backoff(
+    url: str, session: httpx.AsyncClient, max_retries: int = 5
+) -> httpx.Response | None:
+    """Fetch a raw URL using exponential backoff for rate limits and server errors."""
     delay = BACKOFF_DELAY
     for _ in range(max_retries):
         try:
-            r = session.get(url, timeout=30)
+            r = await session.get(url, timeout=30)
             if r.status_code == http.HTTPStatus.OK:
                 return r
 
@@ -72,13 +102,38 @@ def _fetch_with_backoff(
             else:
                 logger.error("HTTP %d: Request failed non-recoverably.", r.status_code)
                 return None
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             logger.warning("Request exception: %s. Retrying in %.1fs...", e, delay)
 
-        time.sleep(delay)
+        await asyncio.sleep(delay)
         delay *= BACKOFF_EXPONENT
 
     logger.error("Max retries reached for %s", url)
+    return None
+
+
+async def call_with_backoff(
+    call: Callable[[], Coroutine[Any, Any, T]], max_retries: int = 5
+) -> T | None:
+    """Calls a REST API endpoint using exponential backoff for retryable failures."""
+    delay = BACKOFF_DELAY
+    for _ in range(max_retries):
+        try:
+            return await call()
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code in {429, 500, 502, 503, 504}:
+                logger.warning("HTTP %d, retrying in %.1fs...", code, delay)
+            else:
+                logger.exception("HTTP %d: Request failed non-recoverably.", code)
+                return None
+        except httpx.HTTPError as e:
+            logger.warning("Request exception: %s. Retrying in %.1fs...", e, delay)
+
+        await asyncio.sleep(delay)
+        delay *= BACKOFF_EXPONENT
+
+    logger.error("Max retries reached")
     return None
 
 
@@ -143,24 +198,24 @@ def clean_smiles(raw_inputs: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(canons))
 
 
-def rate_sleep(prev: float) -> None:
+async def rate_sleep(prev: float) -> None:
     """Pause execution to ensure the API request rate limit is not exceeded."""
     elapsed = time.monotonic() - prev
     delay = 1.0 / RATE_LIMIT - elapsed
-    if delay > 0:
-        time.sleep(delay)
+    if delay > 0:  # pragma: no branch
+        await asyncio.sleep(delay)
 
 
-def fetch_cid_bulk(
+async def fetch_cid_bulk(  # noqa: C901,PLR0912
     smiles_list: Sequence[str],
-    session: requests.Session,
+    client: PubChemClient,
     redirect_url: str | None = None,
 ) -> dict[str, int]:
     """Resolve a batch of SMILES to their corresponding PubChem CIDs.
 
     Args:
         smiles_list: A list of canonical SMILES strings.
-        session: The requests session to use for HTTP calls.
+        client: The declarative PubChem client to use for HTTP calls.
         redirect_url: An existing batch job URL to poll.
 
     Returns:
@@ -172,41 +227,33 @@ def fetch_cid_bulk(
     if not smiles_list:  # pragma: no cover
         return {}
 
-    files = {
-        "inputtype": (None, "smiles"),
-        "inputdsn": (None, ""),
-        "idinput": (None, "str"),
-        "idstr": (None, "\n".join(smiles_list)),
-        "idfile": ("", "", "application/octet-stream"),
-        "operatortype": (None, "samecid"),
-        "outputtype": (None, "cid"),
-        "outputdsn": (None, ""),
-        "method": (None, "file-pair"),
-        "compression": (None, "gzip"),
-        "submitjob": (None, "Submit Job"),
-        "xmlfile": ("", "", "application/octet-stream"),
-    }
-
     status_code: int | None = None
     delay = POLL_DELAY
 
     for _ in range(10):
         if redirect_url:
             logger.info("Batch processing in progress, polling results...")
-            r = session.get(redirect_url)
+            r = await client.session.get(redirect_url)
+            status_code = r.status_code
+            if r.status_code != http.HTTPStatus.OK:  # pragma: no cover
+                logger.warning("Request failed with status code: %d", r.status_code)
+                await asyncio.sleep(delay)
+                continue
+            text = r.text
         else:
             logger.info("Submitting batch job...")
-            r = session.post(PUBCHEM_ID_EXCHANGE, files=files)  # type: ignore[arg-type]
-
-        status_code = r.status_code
-        if r.status_code != http.HTTPStatus.OK:  # pragma: no cover
-            logger.warning("Request failed with status code: %d", r.status_code)
-            time.sleep(delay)
-            continue
+            try:
+                text = await client.submit_batch(idstr=(None, "\n".join(smiles_list)))
+                status_code = http.HTTPStatus.OK
+            except httpx.HTTPStatusError as e:  # pragma: no cover
+                status_code = e.response.status_code
+                logger.warning("Request failed with status code: %d", status_code)
+                await asyncio.sleep(delay)
+                continue
 
         match = re.search(
             r'document.location.replace\("(https://pubchem.ncbi.nlm.nih.gov/[^"]+)"',
-            r.text,
+            text,
         )
 
         if match:
@@ -214,7 +261,7 @@ def fetch_cid_bulk(
 
             if url.endswith(".gz"):
                 logger.info("Batch processing finished, downloading results...")
-                fr = _fetch_with_backoff(url, session)
+                fr = await fetch_with_backoff(url, client.session)
                 if fr:
                     with gzip.open(BytesIO(fr.content), "rt") as f:
                         smiles_to_cid: dict[str, int] = {}
@@ -226,7 +273,7 @@ def fetch_cid_bulk(
                     raise ValueError("File download failed repeatedly.")
 
             redirect_url = url
-            time.sleep(delay)
+            await asyncio.sleep(delay)
         else:
             raise ValueError("No download or redirect link found")
 
@@ -238,8 +285,11 @@ def fetch_cid_bulk(
     raise ValueError(f"Submitting batch job failed, last status code: {status_code}")
 
 
-def fetch_properties_bulk(
-    cids: Sequence[int], properties: Sequence[str], session: requests.Session, verbose: bool = False
+async def fetch_properties_bulk(
+    cids: Sequence[int],
+    properties: Sequence[str],
+    client: PubChemClient,
+    verbose: bool = False,
 ) -> dict[int, dict[str, Any]]:
     """Fetch user-defined properties for a list of CIDs in batches.
 
@@ -249,7 +299,7 @@ def fetch_properties_bulk(
     Args:
         cids: A list of PubChem Compound IDs.
         properties: A list of PubChem properties (e.g. 'IUPACName', 'MolecularWeight').
-        session: The requests session to use for HTTP calls.
+        client: The declarative PubChem client to use for HTTP calls.
         verbose: Whether to display a progress bar.
 
     Returns:
@@ -265,26 +315,27 @@ def fetch_properties_bulk(
     for batch_start in tqdm(
         range(0, len(cids), 5000), desc="Fetching properties...", disable=not verbose
     ):
-        rate_sleep(t0)
+        await rate_sleep(t0)
         t0 = time.monotonic()
 
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
-        url = PUBCHEM_PROPERTIES.format(cids=cid_str, props=props_str)
 
-        r = _fetch_with_backoff(url, session)
-        if r:
-            props = r.json().get("PropertyTable", {}).get("Properties", [])
+        payload = await call_with_backoff(
+            functools.partial(client.get_properties, cid_str, props_str)
+        )
+        if payload:
+            props = payload.get("PropertyTable", {}).get("Properties", [])
             for row in props:
                 cid = row.pop("CID")
-                if cid is not None:
+                if cid is not None:  # pragma: no branch
                     results[cid] = row
 
     return results
 
 
-def fetch_synonyms_bulk(
-    cids: Sequence[int], session: requests.Session, verbose: bool = False
+async def fetch_synonyms_bulk(
+    cids: Sequence[int], client: PubChemClient, verbose: bool = False
 ) -> dict[int, list[str]]:
     """Fetch common synonyms for a list of CIDs.
 
@@ -293,7 +344,7 @@ def fetch_synonyms_bulk(
 
     Args:
         cids: A list of PubChem Compound IDs.
-        session: The requests session to use for HTTP calls.
+        client: The declarative PubChem client to use for HTTP calls.
         verbose: Whether to display a progress bar.
 
     Returns:
@@ -308,15 +359,14 @@ def fetch_synonyms_bulk(
     for batch_start in tqdm(
         range(0, len(cids), 5000), desc="Fetching synonyms...", disable=not verbose
     ):
-        rate_sleep(t0)
+        await rate_sleep(t0)
         t0 = time.monotonic()
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
-        url = PUBCHEM_SYNONYMS.format(cids=cid_str)
 
-        r = _fetch_with_backoff(url, session)
-        if r:
-            infos = r.json().get("InformationList", {}).get("Information", [])
+        payload = await call_with_backoff(functools.partial(client.get_synonyms, cid_str))
+        if payload:
+            infos = payload.get("InformationList", {}).get("Information", [])
             for info in infos:
                 cid = info.get("CID")
                 syns = info.get("Synonym", [])
@@ -326,7 +376,76 @@ def fetch_synonyms_bulk(
     return results
 
 
-def main(  # noqa: C901,PLR0912,PLR0913,PLR0915
+async def fetch_all(  # noqa: C901
+    smiles_inputs: Sequence[str],
+    properties: list[str],
+    batch_url: str | None,
+    max_synonyms: int,
+    verbose: bool,
+) -> tuple[dict[str, int], dict[int, dict[str, Any]]]:
+    """Drive the CID/property/synonym lookups for `main` over a single declarative client."""
+
+    @contextmanager
+    def dummy_spinner() -> Generator[SpinnerDummy]:
+        yield SpinnerDummy()
+
+    spinner_fn = dummy_spinner if verbose else yaspin.yaspin
+
+    async with PubChemClient() as client:
+        with spinner_fn() as sp:
+            sp.text = "Cleaning SMILES..."
+            canonical_smiles = clean_smiles(smiles_inputs)
+
+            if not canonical_smiles:
+                logger.error("No valid SMILES after canonicalization.")
+                raise SystemExit(1)
+
+            logger.info("Unique canonical SMILES to look up: %d", len(canonical_smiles))
+
+            sp.text = "Requesting CIDs..."
+            smiles_to_cid = await fetch_cid_bulk(canonical_smiles, client, batch_url)
+
+            if not smiles_to_cid:
+                logger.error("No SMILES resolved to a PubChem CID.")
+                raise SystemExit(1)
+
+            logger.info("Resolved %d/%d SMILES → CID", len(smiles_to_cid), len(canonical_smiles))
+
+            cids = list(smiles_to_cid.values())
+
+            cid_to_syns: dict[int, list[str]] | None = None
+            fetch_synonyms = "synonyms" in properties
+            fetch_label = "label" in properties
+            fetch_iupac = "IUPACName" in properties
+
+            if fetch_synonyms or fetch_label:
+                sp.text = "Fetching synonyms..."
+                cid_to_syns = await fetch_synonyms_bulk(cids, client, verbose=verbose)
+                if fetch_synonyms:
+                    properties.remove("synonyms")
+                if fetch_label:
+                    properties.remove("label")
+                    if not fetch_iupac:
+                        properties.append("IUPACName")
+
+            sp.text = "Fetching properties..."
+            cid_to_props = await fetch_properties_bulk(cids, properties, client, verbose)
+
+            if cid_to_syns:
+                for cid, syns in cid_to_syns.items():
+                    data = cid_to_props[cid]
+                    if fetch_synonyms:
+                        data["synonyms"] = "|".join(
+                            s.replace("|", "\\|") for s in syns[:max_synonyms]
+                        )
+                    if fetch_label:
+                        iupac_name = data["IUPACName"] if fetch_iupac else data.pop("IUPACName")
+                        data["label"] = pick_label(syns, iupac_name)
+
+    return smiles_to_cid, cid_to_props
+
+
+def main(  # noqa: PLR0913,PLR0917
     smiles_inputs: list[str],
     properties: list[str] = ("IUPACName",),  # type:ignore[assignment]
     output: Path | None = None,
@@ -350,7 +469,6 @@ def main(  # noqa: C901,PLR0912,PLR0913,PLR0915
         verbose: Whether to log detailed process information and show progress bars.
     """
     import polars as pl
-    import requests
     from rdkit import Chem
 
     logging.basicConfig(
@@ -358,61 +476,9 @@ def main(  # noqa: C901,PLR0912,PLR0913,PLR0915
         format="%(levelname)-8s %(message)s",
     )
 
-    session = requests.Session()
-    max_synonyms = max(max_synonyms or 1, 1)
-
-    @contextmanager
-    def dummy_spinner() -> Generator[SpinnerDummy]:
-        yield SpinnerDummy()
-
-    spinner_fn = dummy_spinner if verbose else yaspin.yaspin
-    with spinner_fn() as sp:
-        sp.text = "Cleaning SMILES..."
-        canonical_smiles = clean_smiles(smiles_inputs)
-
-        if not canonical_smiles:  # pragma: no cover
-            logger.error("No valid SMILES after canonicalization.")
-            raise SystemExit(1)
-
-        logger.info("Unique canonical SMILES to look up: %d", len(canonical_smiles))
-
-        sp.text = "Requesting CIDs..."
-        smiles_to_cid = fetch_cid_bulk(canonical_smiles, session, batch_url)
-
-        if not smiles_to_cid:  # pragma: no cover
-            logger.error("No SMILES resolved to a PubChem CID.")
-            raise SystemExit(1)
-
-        logger.info("Resolved %d/%d SMILES → CID", len(smiles_to_cid), len(canonical_smiles))
-
-        cids = list(smiles_to_cid.values())
-
-        cid_to_syns: dict[int, list[str]] | None = None
-        fetch_synonyms = "synonyms" in properties
-        fetch_label = "label" in properties
-        fetch_iupac = "IUPACName" in properties
-
-        if fetch_synonyms or fetch_label:
-            sp.text = "Fetching synonyms..."
-            cid_to_syns = fetch_synonyms_bulk(cids, session, verbose=verbose)
-            if fetch_synonyms:
-                properties.remove("synonyms")
-            if fetch_label:
-                properties.remove("label")
-                if not fetch_iupac:
-                    properties.append("IUPACName")
-
-        sp.text = "Fetching properties..."
-        cid_to_props = fetch_properties_bulk(cids, properties, session, verbose)
-
-        if cid_to_syns:
-            for cid, syns in cid_to_syns.items():
-                data = cid_to_props[cid]
-                if fetch_synonyms:
-                    data["synonyms"] = "|".join(s.replace("|", "\\|") for s in syns[:max_synonyms])
-                if fetch_label:
-                    iupac_name = data["IUPACName"] if fetch_iupac else data.pop("IUPACName")
-                    data["label"] = pick_label(syns, iupac_name)
+    smiles_to_cid, cid_to_props = asyncio.run(
+        fetch_all(smiles_inputs, list(properties), batch_url, max(max_synonyms or 1, 1), verbose)
+    )
 
     # Compile the resulting DataFrame
     rows: list[dict[str, Any]] = []
@@ -435,7 +501,8 @@ def main(  # noqa: C901,PLR0912,PLR0913,PLR0915
         df.write_csv(buffer)
         print(buffer.getvalue().strip())  # noqa: T201
     else:
-        df.write_csv(output)
+        # https://github.com/python/cpython/issues/106749 (Python 3.11 only)
+        df.write_csv(output)  # pragma: no cover
 
 
 if __name__ == "__main__":
