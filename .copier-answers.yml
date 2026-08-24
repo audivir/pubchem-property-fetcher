@@ -1,0 +1,10 @@
+# Changes here will be overwritten by Copier
+_commit: 50c7f55
+_src_path: gh:audivir/copier-template
+author_email: pypi@audivir.de
+author_name: Tim Hörmann
+description: Resolve SMILES to CIDs and fetch user-defined properties from PubChem.
+github_org: audivir
+project_name: pubchem-property-fetcher
+project_slug: pubchem_property_fetcher
+project_type: python

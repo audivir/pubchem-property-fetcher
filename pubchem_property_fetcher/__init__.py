@@ -16,7 +16,6 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypeVar
 
-import doctyper
 import httpx
 import yaspin
 from mxhttp import AsyncConsumer, Part, PartValue, get, post
@@ -503,9 +502,3 @@ def main(  # noqa: PLR0913,PLR0917
     else:
         # https://github.com/python/cpython/issues/106749 (Python 3.11 only)
         df.write_csv(output)  # pragma: no cover
-
-
-if __name__ == "__main__":
-    app = doctyper.DocTyper()
-    app.command()(main)
-    app()

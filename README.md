@@ -28,8 +28,8 @@ python -m pubchem_property_fetcher "OCC.CC" "CCO" "CCC" \
 
 **Special Properties:**
 
-* `--properties synonyms`: Fetches common aliases for the structures. Limit the amount returned with `--max-synonyms N`.
-* `--properties label`: A custom pipeline property that heuristically picks the most human-readable name from the synonym list, falling back to the formal IUPAC name if no good synonyms exist.
+- `--properties synonyms`: Fetches common aliases for the structures. Limit the amount returned with `--max-synonyms N`.
+- `--properties label`: A custom pipeline property that heuristically picks the most human-readable name from the synonym list, falling back to the formal IUPAC name if no good synonyms exist.
 
 *For standard properties like `MolecularWeight`, `XLogP`, `ExactMass`, or `TPSA`, see the [PubChem PUG REST Docs](https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest-tutorial).*
 
