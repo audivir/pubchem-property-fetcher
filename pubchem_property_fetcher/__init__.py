@@ -1,9 +1,8 @@
-"""Resolve SMILES to CIDs and fetch user-defined properties from PubChem."""
+"""Resolves SMILES strings to CIDs and fetches user-defined properties from PubChem."""
 
 from __future__ import annotations
 
 import asyncio
-import functools
 import gzip
 import http
 import logging
@@ -14,21 +13,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
 import httpx
 import yaspin
-from mxhttp import AsyncConsumer, Part, PartValue, get, post
+from mxhttp import AsyncConsumer, Part, PartValue, RawPath, Retry, get, post, retry
 from tqdm import tqdm
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Generator, Sequence
+    from collections.abc import Generator, Sequence
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov"
 RATE_LIMIT = 5.0  # requests per second
@@ -38,7 +35,7 @@ POLL_DELAY = 1.0  # seconds
 
 
 class HasText(Protocol):
-    """Protocol with single text attribute."""
+    """Interface for objects with a single text attribute."""
 
     text: str
 
@@ -50,14 +47,15 @@ class SpinnerDummy:
     text: str = ""
 
 
+@retry(Retry(attempts=5, backoff=BACKOFF_DELAY, exponent=BACKOFF_EXPONENT))
 class PubChemClient(AsyncConsumer):
-    """Declarative async client for PubChem's ID Exchange and PUG REST endpoints."""
+    """Declarative async client for PubChem ID Exchange and PUG REST endpoints."""
 
     def __init__(self) -> None:
-        """Binds the client to PubChem's base URL."""
+        """Binds the client to the PubChem base URL."""
         super().__init__(PUBCHEM_BASE_URL)
 
-    @post("/idexchange/idexchange.cgi")
+    @post("/idexchange/idexchange.cgi", retry=None)
     async def submit_batch(  # type: ignore[empty-body] # noqa: PLR0913,PLR0917
         self,
         idstr: Annotated[PartValue, Part],
@@ -73,7 +71,7 @@ class PubChemClient(AsyncConsumer):
         submitjob: Annotated[PartValue, Part] = (None, "Submit Job"),
         xmlfile: Annotated[PartValue, Part] = ("", "", "application/octet-stream"),
     ) -> str:
-        """Submits a SMILES batch to PubChem's ID Exchange, returning the response HTML."""
+        """Submits a SMILES batch to PubChem ID Exchange and returns the response HTML."""
 
     @get("/rest/pug/compound/cid/{cids}/property/{props}/JSON")
     async def get_properties(self, cids: str, props: str) -> dict[str, Any]:  # type: ignore[empty-body]
@@ -83,61 +81,20 @@ class PubChemClient(AsyncConsumer):
     async def get_synonyms(self, cids: str) -> dict[str, Any]:  # type: ignore[empty-body]
         """Fetches the JSON synonym list for the given comma-separated CIDs."""
 
+    @get(
+        "{path}",
+        retry=Retry(attempts=5, backoff=BACKOFF_DELAY, exponent=BACKOFF_EXPONENT, timeout=30),
+    )
+    async def download_file(self, path: Annotated[str, RawPath]) -> bytes:  # type: ignore[empty-body]
+        """Downloads the batch job one-off result file at `path`, relative to the base URL.
 
-async def fetch_with_backoff(
-    url: str, session: httpx.AsyncClient, max_retries: int = 5
-) -> httpx.Response | None:
-    """Fetch a raw URL using exponential backoff for rate limits and server errors."""
-    delay = BACKOFF_DELAY
-    for _ in range(max_retries):
-        try:
-            r = await session.get(url, timeout=30)
-            if r.status_code == http.HTTPStatus.OK:
-                return r
-
-            # Retry on rate limit or server errors
-            if r.status_code in {429, 500, 502, 503, 504}:
-                logger.warning("HTTP %d, retrying in %.1fs...", r.status_code, delay)
-            else:
-                logger.error("HTTP %d: Request failed non-recoverably.", r.status_code)
-                return None
-        except httpx.HTTPError as e:
-            logger.warning("Request exception: %s. Retrying in %.1fs...", e, delay)
-
-        await asyncio.sleep(delay)
-        delay *= BACKOFF_EXPONENT
-
-    logger.error("Max retries reached for %s", url)
-    return None
-
-
-async def call_with_backoff(
-    call: Callable[[], Coroutine[Any, Any, T]], max_retries: int = 5
-) -> T | None:
-    """Calls a REST API endpoint using exponential backoff for retryable failures."""
-    delay = BACKOFF_DELAY
-    for _ in range(max_retries):
-        try:
-            return await call()
-        except httpx.HTTPStatusError as e:
-            code = e.response.status_code
-            if code in {429, 500, 502, 503, 504}:
-                logger.warning("HTTP %d, retrying in %.1fs...", code, delay)
-            else:
-                logger.exception("HTTP %d: Request failed non-recoverably.", code)
-                return None
-        except httpx.HTTPError as e:
-            logger.warning("Request exception: %s. Retrying in %.1fs...", e, delay)
-
-        await asyncio.sleep(delay)
-        delay *= BACKOFF_EXPONENT
-
-    logger.error("Max retries reached")
-    return None
+        `RawPath` splices `path` into the request unquoted, so it may contain `/` and `?`
+        (e.g. a full relative reference with a query string) without being escaped.
+        """
 
 
 def synonym_score(s: str, ix: int, index_factor: float) -> float:
-    """Calculate a heuristic score for a given synonym string to determine its usability."""
+    """Calculates a heuristic score for a synonym string to determine its usability."""
     score = -ix * index_factor
 
     # simple lowercase common-looking name
@@ -154,14 +111,14 @@ def synonym_score(s: str, ix: int, index_factor: float) -> float:
 
 
 def sort_synonyms(synonyms: Sequence[str], index_factor: float = 1000.0) -> list[str]:
-    """Sort a sequence of synonyms based on a calculated heuristic score."""
+    """Sorts synonyms by descending heuristic score."""
     scored = [(synonym_score(s, i, index_factor), s) for i, s in enumerate(synonyms)]
 
     return [s for _, s in sorted(scored, key=lambda x: x[0], reverse=True)]
 
 
 def pick_label(synonyms: list[str], iupac: str | None) -> str | None:
-    """Select the most readable label, preferring the first synonym over the IUPAC name."""
+    """Selects the most readable label, preferring the first synonym over the IUPAC name."""
     for s in synonyms:
         return s.lower()
     if iupac:
@@ -170,14 +127,7 @@ def pick_label(synonyms: list[str], iupac: str | None) -> str | None:
 
 
 def clean_smiles(raw_inputs: Sequence[str]) -> list[str]:
-    """Split fragments, canonicalize with RDKit, and deduplicate the given SMILES.
-
-    Args:
-        raw_inputs: A sequence of raw SMILES strings.
-
-    Returns:
-        A list of unique, canonicalized SMILES strings.
-    """
+    """Splits fragments, canonicalizes with RDKit, and deduplicates the given SMILES."""
     from rdkit import Chem, rdBase
 
     rdBase.DisableLog("rdApp.*")
@@ -198,19 +148,19 @@ def clean_smiles(raw_inputs: Sequence[str]) -> list[str]:
 
 
 async def rate_sleep(prev: float) -> None:
-    """Pause execution to ensure the API request rate limit is not exceeded."""
+    """Pauses execution to ensure the API request rate limit is not exceeded."""
     elapsed = time.monotonic() - prev
     delay = 1.0 / RATE_LIMIT - elapsed
     if delay > 0:  # pragma: no branch
         await asyncio.sleep(delay)
 
 
-async def fetch_cid_bulk(  # noqa: C901,PLR0912
+async def fetch_cid_bulk(
     smiles_list: Sequence[str],
     client: PubChemClient,
     redirect_url: str | None = None,
 ) -> dict[str, int]:
-    """Resolve a batch of SMILES to their corresponding PubChem CIDs.
+    """Resolves a batch of SMILES to their corresponding PubChem CIDs.
 
     Args:
         smiles_list: A list of canonical SMILES strings.
@@ -221,7 +171,8 @@ async def fetch_cid_bulk(  # noqa: C901,PLR0912
         A dictionary mapping the original SMILES strings to their PubChem CIDs.
 
     Raises:
-        ValueError: If the file download fails, no link is found, or the batch job fails.
+        ValueError: If no download or redirect link is found, or the batch job fails.
+        httpx.HTTPError: If the result file download fails non-recoverably.
     """
     if not smiles_list:  # pragma: no cover
         return {}
@@ -260,16 +211,13 @@ async def fetch_cid_bulk(  # noqa: C901,PLR0912
 
             if url.endswith(".gz"):
                 logger.info("Batch processing finished, downloading results...")
-                fr = await fetch_with_backoff(url, client.session)
-                if fr:
-                    with gzip.open(BytesIO(fr.content), "rt") as f:
-                        smiles_to_cid: dict[str, int] = {}
-                        for line in f.read().splitlines():
-                            smiles, cid = line.split("\t", maxsplit=1)
-                            smiles_to_cid[smiles] = int(cid)
-                        return smiles_to_cid
-                else:  # pragma: no cover
-                    raise ValueError("File download failed repeatedly.")
+                content = await client.download_file(url.removeprefix(PUBCHEM_BASE_URL))
+                with gzip.open(BytesIO(content), "rt") as f:
+                    smiles_to_cid: dict[str, int] = {}
+                    for line in f.read().splitlines():
+                        smiles, cid = line.split("\t", maxsplit=1)
+                        smiles_to_cid[smiles] = int(cid)
+                    return smiles_to_cid
 
             redirect_url = url
             await asyncio.sleep(delay)
@@ -290,19 +238,19 @@ async def fetch_properties_bulk(
     client: PubChemClient,
     verbose: bool = False,
 ) -> dict[int, dict[str, Any]]:
-    """Fetch user-defined properties for a list of CIDs in batches.
+    """Fetches user-defined properties for a list of CIDs in batches.
 
     PubChem accepts up to 5000 CIDs per request, so lists exceeding this limit
     are automatically batched.
 
     Args:
-        cids: A list of PubChem Compound IDs.
-        properties: A list of PubChem properties (e.g. 'IUPACName', 'MolecularWeight').
-        client: The declarative PubChem client to use for HTTP calls.
+        cids: PubChem Compound IDs.
+        properties: PubChem properties (e.g. 'IUPACName', 'MolecularWeight').
+        client: Declarative PubChem client for HTTP calls.
         verbose: Whether to display a progress bar.
 
     Returns:
-        A dictionary mapping CIDs to their requested properties.
+        Mapping of CIDs to their requested properties.
     """
     if not cids or not properties:  # pragma: no cover
         return {}
@@ -320,15 +268,17 @@ async def fetch_properties_bulk(
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
 
-        payload = await call_with_backoff(
-            functools.partial(client.get_properties, cid_str, props_str)
-        )
-        if payload:
-            props = payload.get("PropertyTable", {}).get("Properties", [])
-            for row in props:
-                cid = row.pop("CID")
-                if cid is not None:  # pragma: no branch
-                    results[cid] = row
+        try:
+            payload = await client.get_properties(cid_str, props_str)
+        except httpx.HTTPError as e:
+            logger.warning("Request failed non-recoverably: %s", e)
+            continue
+
+        props = payload.get("PropertyTable", {}).get("Properties", [])
+        for row in props:
+            cid = row.pop("CID")
+            if cid is not None:  # pragma: no branch
+                results[cid] = row
 
     return results
 
@@ -336,18 +286,18 @@ async def fetch_properties_bulk(
 async def fetch_synonyms_bulk(
     cids: Sequence[int], client: PubChemClient, verbose: bool = False
 ) -> dict[int, list[str]]:
-    """Fetch common synonyms for a list of CIDs.
+    """Fetches common synonyms for a list of CIDs.
 
     PubChem accepts up to 5000 CIDs per request, so lists exceeding this limit
     are automatically batched.
 
     Args:
-        cids: A list of PubChem Compound IDs.
-        client: The declarative PubChem client to use for HTTP calls.
+        cids: PubChem Compound IDs.
+        client: Declarative PubChem client for HTTP calls.
         verbose: Whether to display a progress bar.
 
     Returns:
-        A dictionary mapping CIDs to lists of formatted synonym strings.
+        Mapping of CIDs to lists of formatted synonym strings.
     """
     if not cids:  # pragma: no cover
         return {}
@@ -363,14 +313,18 @@ async def fetch_synonyms_bulk(
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
 
-        payload = await call_with_backoff(functools.partial(client.get_synonyms, cid_str))
-        if payload:
-            infos = payload.get("InformationList", {}).get("Information", [])
-            for info in infos:
-                cid = info.get("CID")
-                syns = info.get("Synonym", [])
-                if cid is not None:  # pragma: no branch
-                    results[cid] = sort_synonyms(syns)
+        try:
+            payload = await client.get_synonyms(cid_str)
+        except httpx.HTTPError as e:
+            logger.warning("Request failed non-recoverably: %s", e)
+            continue
+
+        infos = payload.get("InformationList", {}).get("Information", [])
+        for info in infos:
+            cid = info.get("CID")
+            syns = info.get("Synonym", [])
+            if cid is not None:  # pragma: no branch
+                results[cid] = sort_synonyms(syns)
 
     return results
 
@@ -382,7 +336,7 @@ async def fetch_all(  # noqa: C901
     max_synonyms: int,
     verbose: bool,
 ) -> tuple[dict[str, int], dict[int, dict[str, Any]]]:
-    """Drive the CID/property/synonym lookups for `main` over a single declarative client."""
+    """Performs CID, property, and synonym lookups for the main workflow."""
 
     @contextmanager
     def dummy_spinner() -> Generator[SpinnerDummy]:
@@ -453,18 +407,15 @@ def main(  # noqa: PLR0913,PLR0917
     max_synonyms: int | None = None,
     verbose: bool = False,
 ) -> None:
-    """Resolve a list of SMILES to canonical SMILES and text labels, then output to CSV.
-
-    Properties can be looked up in the PubChem PUG docs; special properties are synonyms
-    and label (the most readable common name chosen from synonyms, falling back to IUPAC).
+    """Resolves SMILES strings to canonical SMILES and text labels, then writes CSV output.
 
     Args:
-        smiles_inputs: A list of raw SMILES strings to resolve.
-        properties: Properties to fetch.
+        smiles_inputs: Raw SMILES strings to resolve.
+        properties: PubChem properties to fetch.
         output: Path to the output CSV file. If None, prints to stdout.
         keep_stereo: Whether to retain stereochemical information in the SMILES.
-        batch_url: An existing PubChem batch URL to poll instead of starting a new job.
-        max_synonyms: Number of synonyms to fetch, if synonyms are included.
+        batch_url: Existing PubChem batch URL to poll instead of starting a new job.
+        max_synonyms: Maximum number of synonyms to fetch.
         verbose: Whether to log detailed process information and show progress bars.
     """
     import polars as pl

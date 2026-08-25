@@ -1,4 +1,4 @@
-"""Configuration and fixtures for the `pubchem_property_fetcher` tests."""
+"""Configuration and fixtures for the `pubchem_property_fetcher` tests module."""
 
 from __future__ import annotations
 
@@ -30,12 +30,12 @@ PROPERTY_VALUES = {"MolecularWeight": "46.07", "IUPACName": "ethanol"}
 
 
 def redirect_html(url: str) -> str:
-    """Build a fake PubChem ID Exchange response body pointing to `url`."""
+    """Builds a fake PubChem ID Exchange response body pointing to `url`."""
     return f'<html><script>document.location.replace("{url}", "");</script></html>'
 
 
 def gz_response(smiles_to_cid: dict[str, int]) -> httpx.Response:
-    """Build a mocked ID Exchange gzip result mapping SMILES to CIDs."""
+    """Builds a mocked ID Exchange gzip response mapping SMILES to CIDs."""
     buf = BytesIO()
     with gzip.open(buf, "wb") as f:
         f.write("".join(f"{s}\t{cid}\n" for s, cid in smiles_to_cid.items()).encode())

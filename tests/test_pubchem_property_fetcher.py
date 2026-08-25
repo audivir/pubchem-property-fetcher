@@ -1,4 +1,4 @@
-"""Test the pubchem_property_fetcher module."""
+"""Tests for the pubchem_property_fetcher module."""
 
 from __future__ import annotations
 

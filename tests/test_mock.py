@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools
+import asyncio
 import gzip
 import logging
 from contextlib import asynccontextmanager
@@ -14,18 +14,17 @@ import httpx
 import pytest
 import yaspin
 from conftest import fetch_all_handler, gz_response, redirect_html
+from mxhttp import Retry
 
 import pubchem_property_fetcher
 from pubchem_property_fetcher import (
     PUBCHEM_BASE_URL,
     PubChemClient,
     SpinnerDummy,
-    call_with_backoff,
     fetch_all,
     fetch_cid_bulk,
     fetch_properties_bulk,
     fetch_synonyms_bulk,
-    fetch_with_backoff,
     main,
 )
 
@@ -38,22 +37,8 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.anyio
 
 
-@asynccontextmanager
-async def mock_client(handler: Handler) -> AsyncGenerator[PubChemClient]:
-    """A `PubChemClient` whose session is swapped for one backed by a mock transport."""
-    client = PubChemClient()
-    await client.session.aclose()
-    client._session = httpx.AsyncClient(  # noqa: SLF001
-        transport=httpx.MockTransport(handler), base_url=PUBCHEM_BASE_URL
-    )
-    try:
-        yield client
-    finally:
-        await client.session.aclose()
-
-
 def mock_pubchem_client_factory(handler: Handler) -> ClientFactory:
-    """A factory suitable for monkeypatching `PubChemClient`."""
+    """Creates a `PubChemClient` factory suitable for monkeypatching."""
 
     def factory() -> PubChemClient:
         client = PubChemClient()
@@ -65,109 +50,32 @@ def mock_pubchem_client_factory(handler: Handler) -> ClientFactory:
     return factory
 
 
-async def test_fetch_with_backoff_non_recoverable_status() -> None:
-    calls = 0
-
-    def handler(dummy_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(404)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as session:
-        result = await fetch_with_backoff("https://example.test/x", session, max_retries=3)
-
-    assert result is None
-    assert calls == 1
-
-
-async def test_fetch_with_backoff_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
-    calls = 0
-
-    def handler(dummy_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(503)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as session:
-        result = await fetch_with_backoff("https://example.test/x", session, max_retries=3)
-
-    assert result is None
-    assert calls == 3
+@asynccontextmanager
+async def mock_client(handler: Handler) -> AsyncGenerator[PubChemClient]:
+    """Yields a `PubChemClient` whose session is backed by a mock transport."""
+    client = PubChemClient()
+    await client.session.aclose()
+    client._session = httpx.AsyncClient(  # noqa: SLF001
+        transport=httpx.MockTransport(handler), base_url=PUBCHEM_BASE_URL
+    )
+    try:
+        yield client
+    finally:
+        await client.session.aclose()
 
 
-async def test_fetch_with_backoff_recovers_after_connection_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
-    calls = 0
+async def test_download_file_splices_relative_path_unescaped() -> None:
+    seen: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise httpx.ConnectError("boom", request=request)
-        return httpx.Response(200, text="ok")
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as session:
-        result = await fetch_with_backoff("https://example.test/x", session, max_retries=3)
-
-    assert result is not None
-    assert result.text == "ok"
-    assert calls == 2
-
-
-async def test_call_with_backoff_non_recoverable_status() -> None:
-    calls = 0
-
-    def handler(dummy_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(400)
+        seen.append(request.url)
+        return httpx.Response(200, content=b"raw-bytes")
 
     async with mock_client(handler) as client:
-        result = await call_with_backoff(
-            functools.partial(client.get_properties, "1", "MolecularWeight")
-        )
+        result = await client.download_file("/tools/idexchange/result.txt.gz?x=1")
 
-    assert result is None
-    assert calls == 1
-
-
-async def test_call_with_backoff_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
-    calls = 0
-
-    def handler(dummy_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(503)
-
-    async with mock_client(handler) as client:
-        result = await call_with_backoff(
-            functools.partial(client.get_properties, "1", "MolecularWeight"), max_retries=3
-        )
-
-    assert result is None
-    assert calls == 3
-
-
-async def test_call_with_backoff_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
-    calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        raise httpx.ReadTimeout("timed out", request=request)
-
-    async with mock_client(handler) as client:
-        result = await call_with_backoff(
-            functools.partial(client.get_properties, "1", "MolecularWeight"), max_retries=2
-        )
-
-    assert result is None
-    assert calls == 2
+    assert result == b"raw-bytes"
+    assert str(seen[0]) == f"{PUBCHEM_BASE_URL}/tools/idexchange/result.txt.gz?x=1"
 
 
 async def test_fetch_cid_bulk_no_link_found() -> None:
@@ -192,8 +100,12 @@ async def test_fetch_cid_bulk_batch_never_finishes(monkeypatch: pytest.MonkeyPat
 
 
 async def test_fetch_cid_bulk_download_fails_repeatedly(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
     monkeypatch.setattr(pubchem_property_fetcher, "POLL_DELAY", 0.001)
+
+    async def fast_sleep(dummy_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
     gz_url = f"{PUBCHEM_BASE_URL}/tools/idexchange/result.txt.gz"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -202,7 +114,9 @@ async def test_fetch_cid_bulk_download_fails_repeatedly(monkeypatch: pytest.Monk
         return httpx.Response(200, text=redirect_html(gz_url))
 
     async with mock_client(handler) as client:
-        with pytest.raises(ValueError, match="File download failed repeatedly"):
+        # download_file is called directly (not through call_endpoint), so a
+        # non-recoverable failure propagates as the underlying httpx error
+        with pytest.raises(httpx.HTTPStatusError):
             await fetch_cid_bulk(["CCO"], client)
 
 
@@ -248,7 +162,7 @@ async def test_fetch_cid_bulk_polling_recovers_after_error(
 
 
 async def test_fetch_properties_bulk_all_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
+    monkeypatch.setattr(PubChemClient, "_retry", Retry(attempts=2, backoff=0.001))
 
     def handler(dummy_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
@@ -275,7 +189,7 @@ async def test_fetch_properties_bulk_non_recoverable() -> None:
 
 
 async def test_fetch_synonyms_bulk_all_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pubchem_property_fetcher, "BACKOFF_DELAY", 0.001)
+    monkeypatch.setattr(PubChemClient, "_retry", Retry(attempts=2, backoff=0.001))
 
     def handler(dummy_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)

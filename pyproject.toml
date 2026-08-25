@@ -21,8 +21,8 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "doctyper",
-  "mxhttp",
+  "doctyper>=0.27",
+  "mxhttp>=1.3",
   "polars",
   "rdkit>=2024.0",
   "tqdm",
@@ -37,7 +37,7 @@ Repository = "https://github.com/audivir/pubchem-property-fetcher"
 Issues = "https://github.com/audivir/pubchem-property-fetcher/issues"
 
 [dependency-groups]
-dev = ["mypy==2.3.1", "pytest", "coverage", "prek", "ruff==0.16.4"]
+dev = ["mypy", "pytest", "coverage", "prek", "ruff"]
 
 [tool.pdm.version]
 source = "file"
