@@ -162,7 +162,14 @@ async def test_fetch_cid_bulk_polling_recovers_after_error(
 
 
 async def test_fetch_properties_bulk_all_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(PubChemClient, "_retry", Retry(attempts=2, backoff=0.001))
+    monkeypatch.setattr(
+        PubChemClient,
+        "_class_endpoint_kwargs",
+        {
+            **PubChemClient._class_endpoint_kwargs,  # noqa: SLF001
+            "retry": Retry(attempts=2, backoff=0.001),
+        },
+    )
 
     def handler(dummy_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
@@ -189,7 +196,14 @@ async def test_fetch_properties_bulk_non_recoverable() -> None:
 
 
 async def test_fetch_synonyms_bulk_all_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(PubChemClient, "_retry", Retry(attempts=2, backoff=0.001))
+    monkeypatch.setattr(
+        PubChemClient,
+        "_class_endpoint_kwargs",
+        {
+            **PubChemClient._class_endpoint_kwargs,  # noqa: SLF001
+            "retry": Retry(attempts=2, backoff=0.001),
+        },
+    )
 
     def handler(dummy_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)

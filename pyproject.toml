@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
   "doctyper>=0.27",
-  "mxhttp>=1.3",
+  "mxhttp>=1.7.0",
   "polars",
   "rdkit>=2024.0",
   "tqdm",

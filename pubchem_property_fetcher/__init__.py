@@ -7,7 +7,6 @@ import gzip
 import http
 import logging
 import re
-import time
 import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,18 +16,30 @@ from typing import TYPE_CHECKING, Annotated, Any, Protocol
 
 import httpx
 import yaspin
-from mxhttp import AsyncConsumer, Part, PartValue, RawPath, Retry, get, post, retry
+from mxhttp import (
+    AsyncConsumer,
+    Part,
+    PartValue,
+    RateLimit,
+    RawPath,
+    Response,
+    Retry,
+    base_url,
+    get,
+    post,
+    retry,
+)
 from tqdm import tqdm
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 logger = logging.getLogger(__name__)
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov"
-RATE_LIMIT = 5.0  # requests per second
+PUBCHEM_RATE_LIMIT = RateLimit(calls=5, period=1.0)
 BACKOFF_DELAY = 1.0  # seconds
 BACKOFF_EXPONENT = 1.5
 POLL_DELAY = 1.0  # seconds
@@ -47,13 +58,19 @@ class SpinnerDummy:
     text: str = ""
 
 
+def poll_response_handler(response: httpx.Response) -> httpx.Response:
+    """Passes the response through unchanged, without raising for non-2xx status codes.
+
+    The batch-status poll loop in `fetch_cid_bulk` inspects the status code itself to decide
+    whether to keep polling.
+    """
+    return response
+
+
 @retry(Retry(attempts=5, backoff=BACKOFF_DELAY, exponent=BACKOFF_EXPONENT))
+@base_url(PUBCHEM_BASE_URL)
 class PubChemClient(AsyncConsumer):
     """Declarative async client for PubChem ID Exchange and PUG REST endpoints."""
-
-    def __init__(self) -> None:
-        """Binds the client to the PubChem base URL."""
-        super().__init__(PUBCHEM_BASE_URL)
 
     @post("/idexchange/idexchange.cgi", retry=None)
     async def submit_batch(  # type: ignore[empty-body] # noqa: PLR0913,PLR0917
@@ -73,11 +90,11 @@ class PubChemClient(AsyncConsumer):
     ) -> str:
         """Submits a SMILES batch to PubChem ID Exchange and returns the response HTML."""
 
-    @get("/rest/pug/compound/cid/{cids}/property/{props}/JSON")
+    @get("/rest/pug/compound/cid/{cids}/property/{props}/JSON", ratelimit=PUBCHEM_RATE_LIMIT)
     async def get_properties(self, cids: str, props: str) -> dict[str, Any]:  # type: ignore[empty-body]
         """Fetches the JSON property table for the given comma-separated CIDs."""
 
-    @get("/rest/pug/compound/cid/{cids}/synonyms/JSON")
+    @get("/rest/pug/compound/cid/{cids}/synonyms/JSON", ratelimit=PUBCHEM_RATE_LIMIT)
     async def get_synonyms(self, cids: str) -> dict[str, Any]:  # type: ignore[empty-body]
         """Fetches the JSON synonym list for the given comma-separated CIDs."""
 
@@ -90,6 +107,14 @@ class PubChemClient(AsyncConsumer):
 
         `RawPath` splices `path` into the request unquoted, so it may contain `/` and `?`
         (e.g. a full relative reference with a query string) without being escaped.
+        """
+
+    @get("{path}", retry=None, response_handler=poll_response_handler)
+    async def poll_batch(self, path: Annotated[str, RawPath]) -> Response[str]:  # type: ignore[empty-body]
+        """Polls the batch job status page at `path`, relative to the base URL.
+
+        Never raises for non-2xx status codes; the caller inspects
+        `Response.response.status_code` to decide whether to keep polling.
         """
 
 
@@ -147,14 +172,6 @@ def clean_smiles(raw_inputs: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(canons))
 
 
-async def rate_sleep(prev: float) -> None:
-    """Pauses execution to ensure the API request rate limit is not exceeded."""
-    elapsed = time.monotonic() - prev
-    delay = 1.0 / RATE_LIMIT - elapsed
-    if delay > 0:  # pragma: no branch
-        await asyncio.sleep(delay)
-
-
 async def fetch_cid_bulk(
     smiles_list: Sequence[str],
     client: PubChemClient,
@@ -183,13 +200,13 @@ async def fetch_cid_bulk(
     for _ in range(10):
         if redirect_url:
             logger.info("Batch processing in progress, polling results...")
-            r = await client.session.get(redirect_url)
-            status_code = r.status_code
-            if r.status_code != http.HTTPStatus.OK:  # pragma: no cover
-                logger.warning("Request failed with status code: %d", r.status_code)
+            poll = await client.poll_batch(redirect_url.removeprefix(PUBCHEM_BASE_URL))
+            status_code = poll.response.status_code
+            if status_code != http.HTTPStatus.OK:  # pragma: no cover
+                logger.warning("Request failed with status code: %d", status_code)
                 await asyncio.sleep(delay)
                 continue
-            text = r.text
+            text = poll.data
         else:
             logger.info("Submitting batch job...")
             try:
@@ -256,15 +273,11 @@ async def fetch_properties_bulk(
         return {}
 
     results: dict[int, dict[str, Any]] = {}
-    t0 = time.monotonic()
     props_str = ",".join(properties)
 
     for batch_start in tqdm(
         range(0, len(cids), 5000), desc="Fetching properties...", disable=not verbose
     ):
-        await rate_sleep(t0)
-        t0 = time.monotonic()
-
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
 
@@ -303,13 +316,10 @@ async def fetch_synonyms_bulk(
         return {}
 
     results: dict[int, list[str]] = {}
-    t0 = time.monotonic()
 
     for batch_start in tqdm(
         range(0, len(cids), 5000), desc="Fetching synonyms...", disable=not verbose
     ):
-        await rate_sleep(t0)
-        t0 = time.monotonic()
         batch = list(cids[batch_start : batch_start + 5000])
         cid_str = ",".join(str(c) for c in batch)
 
